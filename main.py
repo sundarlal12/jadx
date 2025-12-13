@@ -40,7 +40,8 @@ async def decompile(file: UploadFile = File(...)):
         f.write(await file.read())
 
     # Run JADX: output_dir will contain sources/, resources/, etc.
-    run_cmd(["java", "-jar", JADDX_CLI_JAR, "-d", output_dir, apk_path])
+    #run_cmd(["java", "-jar", JADDX_CLI_JAR, "-d", output_dir, apk_path])
+    run_cmd(["jadx", "-d", output_dir, apk_path])
 
     return JSONResponse({
         "status": "ok",
