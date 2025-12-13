@@ -13,9 +13,9 @@ WORKDIR /app
 RUN mkdir -p /opt/jadx \
     && wget -O /tmp/jadx.zip https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip \
     && unzip /tmp/jadx.zip -d /opt/jadx \
-    && rm /tmp/jadx.zip
-
-ENV JADDX_CLI_JAR=/opt/jadx/jadx-1.5.0/bin/jadx-cli.jar
+    && rm /tmp/jadx.zip \
+    && chmod +x /opt/jadx/jadx-1.5.0/bin/jadx \
+    && ln -sf /opt/jadx/jadx-1.5.0/bin/jadx /usr/local/bin/jadx
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
