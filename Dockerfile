@@ -1,8 +1,7 @@
 FROM python:3.11-slim
 
-# System deps: Java + unzip + wget
 RUN apt-get update && apt-get install -y \
-    openjdk-17-jre-headless \
+    openjdk-21-jre-headless \
     unzip \
     wget \
     ca-certificates \
@@ -16,14 +15,11 @@ RUN mkdir -p /opt/jadx \
     && unzip /tmp/jadx.zip -d /opt/jadx \
     && rm /tmp/jadx.zip
 
-# Used by main.py
 ENV JADDX_CLI_JAR=/opt/jadx/jadx-1.5.0/bin/jadx-cli.jar
 
-# Python deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# App code
 COPY . /app
 
 EXPOSE 8000
