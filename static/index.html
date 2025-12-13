@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>APK Decompiler</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>APK Decompiler</h1>
+      <p class="sub">Drag & drop an <b>.apk</b> file below or click to select.</p>
+
+      <div id="dropzone" class="dropzone" role="button" tabindex="0">
+        <div class="dz-title">Drop APK here</div>
+        <div id="fileName" class="dz-file">No file selected</div>
+        <input id="fileInput" type="file" accept=".apk" />
+      </div>
+
+      <div class="actions">
+        <button id="btnDecompile" class="btn" disabled>Decompile</button>
+        <button id="btnClear" class="btn secondary" disabled>Clear</button>
+      </div>
+
+      <div id="status" class="status">Waiting for APK…</div>
+      <pre id="output" class="output"></pre>
+    </div>
+  </div>
+
+  <script>
+    const dropzone = document.getElementById("dropzone");
+    const fileInput = document.getElementById("fileInput");
+    const fileName = document.getElementById("fileName");
+    const btnDecompile = document.getElementById("btnDecompile");
+    const btnClear = document.getElementById("btnClear");
+    const statusEl = document.getElementById("status");
+    const outputEl = document.getElementById("output");
+
+    let selectedFile = null;
+
+    function setFile(file) {
+      selectedFile = file;
+      fileName.textContent = file ? file.name : "No file selected";
+      btnDecompile.disabled = !file;
+      btnClear.disabled = !file;
+      outputEl.textContent = "";
+      statusEl.textContent = file ? "Ready to decompile." : "Waiting for APK…";
+    }
+
+    // click/keyboard => open file picker
+    dropzone.addEventListener("click", () => fileInput.click());
+    dropzone.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") fileInput.click();
+    });
+
+    fileInput.addEventListener("change", () => {
+      const f = fileInput.files && fileInput.files[0];
+      if (!f) return;
+      if (!f.name.toLowerCase().endsWith(".apk")) {
+        alert("Please select a valid .apk file.");
+        fileInput.value = "";
+        return;
+      }
+      setFile(f);
+    });
+
+    // drag/drop
+    dropzone.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      dropzone.classList.add("dragover");
+    });
+
+    dropzone.addEventListener("dragleave", () => {
+      dropzone.classList.remove("dragover");
+    });
+
+    dropzone.addEventListener("drop", (e) => {
+      e.preventDefault();
+      dropzone.classList.remove("dragover");
+
+      const f = e.dataTransfer.files && e.dataTransfer.files[0];
+      if (!f) return;
+
+      if (!f.name.toLowerCase().endsWith(".apk")) {
+        alert("Please drop a valid .apk file.");
+        return;
+      }
+      setFile(f);
+    });
+
+    btnClear.addEventListener("click", () => {
+      fileInput.value = "";
+      setFile(null);
+    });
+
+    btnDecompile.addEventListener("click", async () => {
+      if (!selectedFile) return;
+
+      btnDecompile.disabled = true;
+      btnClear.disabled = true;
+      statusEl.textContent = "Uploading & decompiling… (this can take time)";
+      outputEl.textContent = "";
+
+      try {
+        const form = new FormData();
+        form.append("file", selectedFile);
+
+        const res = await fetch("/decompile", {
+          method: "POST",
+          body: form
+        });
+
+        const text = await res.text();
+        let json;
+        try { json = JSON.parse(text); } catch { json = { raw: text }; }
+
+        if (!res.ok) {
+          statusEl.textContent = "Failed.";
+          outputEl.textContent = JSON.stringify(json, null, 2);
+          btnClear.disabled = false;
+          return;
+        }
+
+        statusEl.textContent = "Done ✅";
+        outputEl.textContent = JSON.stringify(json, null, 2);
+        btnClear.disabled = false;
+      } catch (err) {
+        statusEl.textContent = "Error.";
+        outputEl.textContent = String(err);
+        btnClear.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
