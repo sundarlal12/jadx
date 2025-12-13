@@ -68,7 +68,10 @@
 import os
 import tempfile
 import subprocess
+import threading
+from collections import deque
 from bson import ObjectId
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -90,30 +93,89 @@ def home():
 JOBS: Dict[str, Dict[str, Any]] = {}
 EXEC = ThreadPoolExecutor(max_workers=1)  # keep 1 to avoid RAM blowups
 
+MAX_LOG_LINES = 2000  # keep last N lines only (avoid memory blowup)
+
+
 class DecompileFromUrlReq(BaseModel):
     apk_url: str
     scan_id: str | None = None
 
+
 def log(msg: str):
     print(msg, flush=True)
 
-def run_cmd(cmd, timeout_sec=3600):
-    # Capture output so you can see errors in logs
-    p = subprocess.run(
+
+def init_job_logs(scan_id: str):
+    # store logs as deque, JSON endpoint will convert to list
+    JOBS[scan_id]["logs"] = deque(maxlen=MAX_LOG_LINES)
+
+
+def push_log(scan_id: str, line: str):
+    line = (line or "").rstrip("\n")
+    if "logs" not in JOBS[scan_id]:
+        init_job_logs(scan_id)
+    JOBS[scan_id]["logs"].append(line)
+    # also send to Render logs
+    print(f"[{scan_id}] {line}", flush=True)
+
+
+def run_jadx_stream(scan_id: str, output_dir: str, apk_path: str, timeout_sec: int = 3600):
+    """
+    Run JADX and stream stdout/stderr live into JOBS[scan_id]["logs"].
+    """
+    cmd = [
+        "jadx",
+        "--threads-count", "1",
+        "--verbose",
+        "--log-level", "DEBUG",
+        "--show-bad-code",
+        "-d", output_dir,
+        apk_path
+    ]
+
+    push_log(scan_id, "Starting JADX with verbose logs...")
+    push_log(scan_id, "CMD: " + " ".join(cmd))
+
+    proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.STDOUT,  # merge stderr into stdout
         text=True,
-        timeout=timeout_sec
+        bufsize=1,
+        universal_newlines=True,
     )
-    if p.returncode != 0:
-        raise RuntimeError((p.stderr or p.stdout or "Command failed").strip())
-    return p.stdout
+
+    def reader():
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                push_log(scan_id, line)
+        except Exception as e:
+            push_log(scan_id, f"[log-reader-error] {e}")
+
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+
+    try:
+        proc.wait(timeout=timeout_sec)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        raise RuntimeError("JADX timed out")
+
+    if proc.returncode != 0:
+        raise RuntimeError(f"JADX failed with exit code {proc.returncode}")
+
+    push_log(scan_id, "JADX finished successfully.")
+
 
 def worker(scan_id: str, apk_url: str):
     try:
         JOBS[scan_id]["status"] = "downloading"
-        log(f"[{scan_id}] Downloading APK: {apk_url}")
+        init_job_logs(scan_id)
+        push_log(scan_id, f"Downloading APK: {apk_url}")
 
         base_tmp = tempfile.mkdtemp(prefix="apk_scan_")
         output_dir = os.path.join(base_tmp, f"scan_id_{scan_id}")
@@ -121,7 +183,7 @@ def worker(scan_id: str, apk_url: str):
 
         apk_path = os.path.join(output_dir, "app.apk")
 
-        # Download with good timeouts + redirects
+        # Download with redirects + good timeouts
         r = requests.get(apk_url, stream=True, timeout=(20, 300), allow_redirects=True)
         if r.status_code != 200:
             raise RuntimeError(f"Download failed. status={r.status_code}")
@@ -132,29 +194,26 @@ def worker(scan_id: str, apk_url: str):
                 if chunk:
                     f.write(chunk)
                     total += len(chunk)
-        log(f"[{scan_id}] Download complete: {total/1024/1024:.2f} MB")
+
+        push_log(scan_id, f"Download complete: {total/1024/1024:.2f} MB")
 
         JOBS[scan_id]["status"] = "decompiling"
-        log(f"[{scan_id}] Running JADX...")
+        push_log(scan_id, "Running JADX...")
 
-        # IMPORTANT: reduce threads to avoid RAM OOM on small instances
-        run_cmd([
-            "jadx",
-            "--threads-count", "1",
-            "-d", output_dir,
-            apk_path
-        ], timeout_sec=3600)
+        # Stream JADX logs live
+        run_jadx_stream(scan_id, output_dir, apk_path, timeout_sec=3600)
 
         JOBS[scan_id]["status"] = "done"
         JOBS[scan_id]["output_dir"] = output_dir
         JOBS[scan_id]["sources_dir"] = os.path.join(output_dir, "sources")
         JOBS[scan_id]["resources_dir"] = os.path.join(output_dir, "resources")
-        log(f"[{scan_id}] DONE. Output: {output_dir}")
+        push_log(scan_id, f"DONE. Output: {output_dir}")
 
     except Exception as e:
         JOBS[scan_id]["status"] = "error"
         JOBS[scan_id]["error"] = str(e)
-        log(f"[{scan_id}] ERROR: {e}")
+        push_log(scan_id, f"ERROR: {e}")
+
 
 @app.post("/decompile")
 def decompile_from_url(payload: DecompileFromUrlReq):
@@ -172,8 +231,10 @@ def decompile_from_url(payload: DecompileFromUrlReq):
     return JSONResponse({
         "status": "accepted",
         "scan_id": scan_id,
-        "status_url": f"/status/{scan_id}"
+        "status_url": f"/status/{scan_id}",
+        "logs_url": f"/logs/{scan_id}",
     })
+
 
 @app.get("/status/{scan_id}")
 def status(scan_id: str):
@@ -181,4 +242,25 @@ def status(scan_id: str):
     if not job:
         raise HTTPException(404, "scan_id not found")
 
-    return JSONResponse(job)
+    # convert deque to list for JSON serialization
+    resp = dict(job)
+    if "logs" in resp and isinstance(resp["logs"], deque):
+        resp["logs"] = list(resp["logs"])
+    return JSONResponse(resp)
+
+
+@app.get("/logs/{scan_id}")
+def get_logs(scan_id: str):
+    job = JOBS.get(scan_id)
+    if not job:
+        raise HTTPException(404, "scan_id not found")
+
+    logs = job.get("logs", deque())
+    if isinstance(logs, deque):
+        logs = list(logs)
+
+    return JSONResponse({
+        "scan_id": scan_id,
+        "status": job.get("status"),
+        "logs": logs
+    })
