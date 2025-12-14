@@ -84,8 +84,8 @@ app = FastAPI(title="APK Decompiler (JADX)")
 # -------------------------
 # CONFIG
 # -------------------------
-OUTPUT_ROOT = os.getenv("OUTPUT_ROOT", "/app/output")
-os.makedirs(OUTPUT_ROOT, exist_ok=True)
+# OUTPUT_ROOT = os.getenv("OUTPUT_ROOT", "/app/output")
+# os.makedirs(OUTPUT_ROOT, exist_ok=True)
 
 MAX_LOG_LINES = 2000
 JOBS: Dict[str, Dict[str, Any]] = {}
@@ -192,12 +192,15 @@ def worker(scan_id: str, apk_url: str):
     try:
         JOBS[scan_id]["status"] = "downloading"
         init_job_logs(scan_id)
-        push_log(scan_id, f"OUTPUT_ROOT={OUTPUT_ROOT}")
+        #push_log(scan_id, f"OUTPUT_ROOT={OUTPUT_ROOT}")
         push_log(scan_id, f"Downloading APK: {apk_url}")
 
         # ✅ consistent scan directory
-        output_dir = os.path.join(OUTPUT_ROOT, f"scan_id_{scan_id}")
+        BASE_DIR = os.getcwd()   # /app inside Docker
+        output_dir = os.path.join(BASE_DIR, f"scan_id_{scan_id}")
         os.makedirs(output_dir, exist_ok=True)
+
+        #os.makedirs(output_dir, exist_ok=True)
         apk_path = os.path.join(output_dir, "app.apk")
 
         # Download with redirects + good timeouts
@@ -290,7 +293,7 @@ def get_logs(scan_id: str):
 # -------------------------
 @app.get("/browse/{scan_id}")
 def browse(scan_id: str, path: str = ""):
-    scan_dir = os.path.join(OUTPUT_ROOT, f"scan_id_{scan_id}")
+    scan_dir = os.path.join(os.getcwd(), f"scan_id_{scan_id}")
     if not os.path.isdir(scan_dir):
         raise HTTPException(404, "scan_id directory not found")
 
@@ -328,7 +331,7 @@ def browse(scan_id: str, path: str = ""):
 # -------------------------
 @app.get("/file/{scan_id}")
 def read_file(scan_id: str, path: str, max_kb: int = 256):
-    scan_dir = os.path.join(OUTPUT_ROOT, f"scan_id_{scan_id}")
+    scan_dir = os.path.join(os.getcwd(), f"scan_id_{scan_id}")
     if not os.path.isdir(scan_dir):
         raise HTTPException(404, "scan_id directory not found")
 
