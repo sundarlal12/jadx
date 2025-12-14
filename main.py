@@ -71,7 +71,7 @@ import subprocess
 import threading
 from collections import deque
 from bson import ObjectId
-
+from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -263,4 +263,95 @@ def get_logs(scan_id: str):
         "scan_id": scan_id,
         "status": job.get("status"),
         "logs": logs
+    })
+
+
+
+
+def safe_join(base: str, *paths: str) -> str:
+    """
+    Prevent path traversal (../..).
+    """
+    base_path = Path(base).resolve()
+    target = base_path.joinpath(*paths).resolve()
+    if not str(target).startswith(str(base_path) + os.sep):
+        raise HTTPException(400, "Invalid path")
+    return str(target)
+
+@app.get("/browse/{scan_id}")
+def browse(scan_id: str, path: str = ""):
+    """
+    List directories/files for a scan_id.
+    Example:
+      /browse/<scan_id>?path=
+      /browse/<scan_id>?path=sources
+      /browse/<scan_id>?path=resources
+    """
+    scan_dir = os.path.join(OUTPUT_ROOT, f"scan_id_{scan_id}")
+    if not os.path.isdir(scan_dir):
+        raise HTTPException(404, "scan_id directory not found")
+
+    target = safe_join(scan_dir, path) if path else scan_dir
+    if not os.path.exists(target):
+        raise HTTPException(404, "Path not found")
+
+    if os.path.isfile(target):
+        return JSONResponse({
+            "scan_id": scan_id,
+            "path": path,
+            "type": "file",
+            "name": os.path.basename(target),
+            "size_bytes": os.path.getsize(target),
+        })
+
+    items = []
+    for name in sorted(os.listdir(target)):
+        full = os.path.join(target, name)
+        items.append({
+            "name": name,
+            "type": "dir" if os.path.isdir(full) else "file",
+            "size_bytes": None if os.path.isdir(full) else os.path.getsize(full)
+        })
+
+    return JSONResponse({
+        "scan_id": scan_id,
+        "path": path,
+        "type": "dir",
+        "items": items
+    })
+
+@app.get("/file/{scan_id}")
+def read_file(scan_id: str, path: str, max_kb: int = 256):
+    """
+    Read a text file content (preview) for a scan.
+    Example:
+      /file/<scan_id>?path=sources/com/test/MainActivity.java
+    """
+    scan_dir = os.path.join(OUTPUT_ROOT, f"scan_id_{scan_id}")
+    if not os.path.isdir(scan_dir):
+        raise HTTPException(404, "scan_id directory not found")
+
+    target = safe_join(scan_dir, path)
+    if not os.path.isfile(target):
+        raise HTTPException(404, "File not found")
+
+    # limit read
+    max_bytes = max_kb * 1024
+    size = os.path.getsize(target)
+
+    with open(target, "rb") as f:
+        data = f.read(min(size, max_bytes))
+
+    # best-effort decode
+    try:
+        text = data.decode("utf-8", errors="replace")
+    except Exception:
+        text = str(data)
+
+    return JSONResponse({
+        "scan_id": scan_id,
+        "path": path,
+        "size_bytes": size,
+        "truncated": size > max_bytes,
+        "content": text
     })
