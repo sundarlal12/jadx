@@ -64,65 +64,80 @@
 #         "resources_dir": os.path.join(output_dir, "resources")
 #     })
 
-
 import os
-import tempfile
 import subprocess
 import threading
 from collections import deque
-from bson import ObjectId
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, Any
+
+import requests
+from bson import ObjectId
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-import requests
-from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Any
 
 app = FastAPI(title="APK Decompiler (JADX)")
 
-# Static UI (optional)
+# -------------------------
+# CONFIG
+# -------------------------
+OUTPUT_ROOT = os.getenv("OUTPUT_ROOT", "/app/output")
+os.makedirs(OUTPUT_ROOT, exist_ok=True)
+
+MAX_LOG_LINES = 2000
+JOBS: Dict[str, Dict[str, Any]] = {}
+EXEC = ThreadPoolExecutor(max_workers=1)  # keep 1 to avoid RAM blowups
+
+# -------------------------
+# STATIC UI
+# -------------------------
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.get("/")
 def home():
     return FileResponse("static/index.html")
 
-# Simple in-memory job store (Render restarts will clear it)
-JOBS: Dict[str, Dict[str, Any]] = {}
-EXEC = ThreadPoolExecutor(max_workers=1)  # keep 1 to avoid RAM blowups
-
-MAX_LOG_LINES = 2000  # keep last N lines only (avoid memory blowup)
-
-
+# -------------------------
+# REQUEST MODELS
+# -------------------------
 class DecompileFromUrlReq(BaseModel):
     apk_url: str
     scan_id: str | None = None
 
-
-def log(msg: str):
-    print(msg, flush=True)
-
-
+# -------------------------
+# LOGGING HELPERS
+# -------------------------
 def init_job_logs(scan_id: str):
-    # store logs as deque, JSON endpoint will convert to list
     JOBS[scan_id]["logs"] = deque(maxlen=MAX_LOG_LINES)
-
 
 def push_log(scan_id: str, line: str):
     line = (line or "").rstrip("\n")
-    if "logs" not in JOBS[scan_id]:
+    if "logs" not in JOBS.get(scan_id, {}):
+        # if called early, create logs container
+        if scan_id not in JOBS:
+            JOBS[scan_id] = {"status": "unknown"}
         init_job_logs(scan_id)
+
     JOBS[scan_id]["logs"].append(line)
-    # also send to Render logs
     print(f"[{scan_id}] {line}", flush=True)
 
+# -------------------------
+# SECURITY: prevent ../ traversal
+# -------------------------
+def safe_join(base: str, *paths: str) -> str:
+    base_path = Path(base).resolve()
+    target = base_path.joinpath(*paths).resolve()
+    if not str(target).startswith(str(base_path) + os.sep):
+        raise HTTPException(400, "Invalid path")
+    return str(target)
 
+# -------------------------
+# RUN JADX WITH LIVE LOG STREAM
+# -------------------------
 def run_jadx_stream(scan_id: str, output_dir: str, apk_path: str, timeout_sec: int = 3600):
-    """
-    Run JADX and stream stdout/stderr live into JOBS[scan_id]["logs"].
-    """
     cmd = [
         "jadx",
         "--threads-count", "1",
@@ -139,7 +154,7 @@ def run_jadx_stream(scan_id: str, output_dir: str, apk_path: str, timeout_sec: i
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,  # merge stderr into stdout
+        stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
         universal_newlines=True,
@@ -170,17 +185,19 @@ def run_jadx_stream(scan_id: str, output_dir: str, apk_path: str, timeout_sec: i
 
     push_log(scan_id, "JADX finished successfully.")
 
-
+# -------------------------
+# WORKER: download + decompile
+# -------------------------
 def worker(scan_id: str, apk_url: str):
     try:
         JOBS[scan_id]["status"] = "downloading"
         init_job_logs(scan_id)
+        push_log(scan_id, f"OUTPUT_ROOT={OUTPUT_ROOT}")
         push_log(scan_id, f"Downloading APK: {apk_url}")
 
-        base_tmp = tempfile.mkdtemp(prefix="apk_scan_")
-        output_dir = os.path.join(base_tmp, f"scan_id_{scan_id}")
+        # ✅ consistent scan directory
+        output_dir = os.path.join(OUTPUT_ROOT, f"scan_id_{scan_id}")
         os.makedirs(output_dir, exist_ok=True)
-
         apk_path = os.path.join(output_dir, "app.apk")
 
         # Download with redirects + good timeouts
@@ -200,7 +217,6 @@ def worker(scan_id: str, apk_url: str):
         JOBS[scan_id]["status"] = "decompiling"
         push_log(scan_id, "Running JADX...")
 
-        # Stream JADX logs live
         run_jadx_stream(scan_id, output_dir, apk_path, timeout_sec=3600)
 
         JOBS[scan_id]["status"] = "done"
@@ -214,18 +230,18 @@ def worker(scan_id: str, apk_url: str):
         JOBS[scan_id]["error"] = str(e)
         push_log(scan_id, f"ERROR: {e}")
 
-
+# -------------------------
+# API: start decompile job
+# -------------------------
 @app.post("/decompile")
 def decompile_from_url(payload: DecompileFromUrlReq):
     scan_id = payload.scan_id or str(ObjectId())
 
-    # create job record
     JOBS[scan_id] = {
         "status": "queued",
-        "apk_url": payload.apk_url
+        "apk_url": payload.apk_url,
     }
 
-    # start background work
     EXEC.submit(worker, scan_id, payload.apk_url)
 
     return JSONResponse({
@@ -233,22 +249,26 @@ def decompile_from_url(payload: DecompileFromUrlReq):
         "scan_id": scan_id,
         "status_url": f"/status/{scan_id}",
         "logs_url": f"/logs/{scan_id}",
+        "browse_url": f"/browse/{scan_id}",
     })
 
-
+# -------------------------
+# API: status
+# -------------------------
 @app.get("/status/{scan_id}")
 def status(scan_id: str):
     job = JOBS.get(scan_id)
     if not job:
         raise HTTPException(404, "scan_id not found")
 
-    # convert deque to list for JSON serialization
     resp = dict(job)
     if "logs" in resp and isinstance(resp["logs"], deque):
         resp["logs"] = list(resp["logs"])
     return JSONResponse(resp)
 
-
+# -------------------------
+# API: logs
+# -------------------------
 @app.get("/logs/{scan_id}")
 def get_logs(scan_id: str):
     job = JOBS.get(scan_id)
@@ -265,28 +285,11 @@ def get_logs(scan_id: str):
         "logs": logs
     })
 
-
-
-
-def safe_join(base: str, *paths: str) -> str:
-    """
-    Prevent path traversal (../..).
-    """
-    base_path = Path(base).resolve()
-    target = base_path.joinpath(*paths).resolve()
-    if not str(target).startswith(str(base_path) + os.sep):
-        raise HTTPException(400, "Invalid path")
-    return str(target)
-
+# -------------------------
+# API: browse scan output
+# -------------------------
 @app.get("/browse/{scan_id}")
 def browse(scan_id: str, path: str = ""):
-    """
-    List directories/files for a scan_id.
-    Example:
-      /browse/<scan_id>?path=
-      /browse/<scan_id>?path=sources
-      /browse/<scan_id>?path=resources
-    """
     scan_dir = os.path.join(OUTPUT_ROOT, f"scan_id_{scan_id}")
     if not os.path.isdir(scan_dir):
         raise HTTPException(404, "scan_id directory not found")
@@ -320,13 +323,11 @@ def browse(scan_id: str, path: str = ""):
         "items": items
     })
 
+# -------------------------
+# API: read file preview
+# -------------------------
 @app.get("/file/{scan_id}")
 def read_file(scan_id: str, path: str, max_kb: int = 256):
-    """
-    Read a text file content (preview) for a scan.
-    Example:
-      /file/<scan_id>?path=sources/com/test/MainActivity.java
-    """
     scan_dir = os.path.join(OUTPUT_ROOT, f"scan_id_{scan_id}")
     if not os.path.isdir(scan_dir):
         raise HTTPException(404, "scan_id directory not found")
@@ -335,14 +336,12 @@ def read_file(scan_id: str, path: str, max_kb: int = 256):
     if not os.path.isfile(target):
         raise HTTPException(404, "File not found")
 
-    # limit read
     max_bytes = max_kb * 1024
     size = os.path.getsize(target)
 
     with open(target, "rb") as f:
         data = f.read(min(size, max_bytes))
 
-    # best-effort decode
     try:
         text = data.decode("utf-8", errors="replace")
     except Exception:
